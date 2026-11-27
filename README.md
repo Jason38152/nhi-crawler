@@ -23,6 +23,8 @@ NhiCrawlerScheduler (@Scheduled 每日 08:00 Asia/Taipei)
 | :--- | :--- |
 | `NhiCrawlerScheduler` | 每日台灣時間 `08:00` 依 `MinguoDate`（民國日期）觸發爬取；若當日無新公告則略過，發生異常時自動寄出告警信。 |
 | `ScraperService` | 透過 CDP 連接已開啟的 Chrome，以同源 `fetch()` 抓取詳細頁與附件至記憶體，並驗證 `.pdf` 檔頭為 `%PDF`。 |
+| `AnnouncementListParser` | 只負責「看懂列表頁」：把 HTML 文字轉成公告列（`AnnouncementRow`）並依刊登日期篩選；不連 Chrome、不上網，可直接用存下來的 HTML 檔做單元測試。 |
+| `DetailPageParser` | 只負責「看懂詳細頁」：找出附件連結（去除重複），並判斷拿到的是否為 Cloudflare 驗證頁。 |
 | `EmailService` | 逐筆檢查每則公告的附件完整性（任一附件失敗即中止寄信），使用 `ByteArrayResource` 直接從記憶體附加檔案寄出。 |
 | `Announcement` | 封裝公告中繼資料（標題、發文字號、刊登日期等）、`Map<String, byte[]>` 記憶體附件與 `failedPdfUrls`。 |
 
@@ -78,6 +80,10 @@ export NHI_CHROME_DEBUGGER_ADDRESS="127.0.0.1:9222"
 
 ### 4. 執行測試或啟動排程服務
 
+* **執行網頁解析單元測試（不需 Chrome、不會寄信，約一秒）**：
+  ```bash
+  ./mvnw test -Dtest='AnnouncementListParserTest,DetailPageParserTest'
+  ```
 * **執行整合測試（抓取最新刊登日期公告並實際寄信）**：
   ```bash
   ./mvnw test -Dtest=NhiCrawlerApplicationTests#scrapeAndSendEmailIntegrationTest

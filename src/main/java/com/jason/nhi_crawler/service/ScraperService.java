@@ -10,7 +10,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -18,10 +17,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
 import org.openqa.selenium.By;
 import org.openqa.selenium.Cookie;
 import org.openqa.selenium.JavascriptExecutor;
@@ -33,6 +28,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import com.jason.nhi_crawler.model.Announcement;
+import com.jason.nhi_crawler.model.AnnouncementRow;
+import com.jason.nhi_crawler.model.AttachmentLink;
+import com.jason.nhi_crawler.parser.AnnouncementListParser;
+import com.jason.nhi_crawler.parser.DetailPageParser;
 
 @Service
 public class ScraperService {
@@ -43,8 +42,19 @@ public class ScraperService {
     private static final Pattern FILENAME_PATTERN =
             Pattern.compile("filename=\"?([^\";]+)\"?", Pattern.CASE_INSENSITIVE);
 
-    @Value("${nhi.chrome.debugger-address:127.0.0.1:9222}")
-    private String debuggerAddress;
+    private final String debuggerAddress;
+    private final AnnouncementListParser listParser;
+    private final DetailPageParser detailPageParser;
+
+    // 建構子注入：需要的東西都從建構子傳進來，測試時可以直接 new ScraperService(...) 換成假物件
+    public ScraperService(
+            @Value("${nhi.chrome.debugger-address:127.0.0.1:9222}") String debuggerAddress,
+            AnnouncementListParser listParser,
+            DetailPageParser detailPageParser) {
+        this.debuggerAddress = debuggerAddress;
+        this.listParser = listParser;
+        this.detailPageParser = detailPageParser;
+    }
 
     private final HttpClient httpClient = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
@@ -70,22 +80,16 @@ public class ScraperService {
             driver.get(TARGET_URL);
             waitForPageReady(driver, By.cssSelector("td.title a"), 30);
 
-            String html = driver.getPageSource();
             System.out.println("列表頁網址: " + driver.getCurrentUrl());
             System.out.println("列表頁標題: " + driver.getTitle());
 
-            Document doc = Jsoup.parse(html);
-            Elements announcementLinks = doc.select("td.title a");
-            System.out.println("找到公告連結數量: " + announcementLinks.size());
-            if (announcementLinks.isEmpty()) {
-                throw new IllegalStateException("未找到公告連結，可能是驗證未通過或網頁結構改變");
-            }
-
-            List<RowMeta> matchedRows = extractMatchingRows(doc, targetPublishDate);
+            // 「看懂網頁」交給 parser；這裡只負責「把網頁拿回來」
+            List<AnnouncementRow> matchedRows =
+                    listParser.parse(driver.getPageSource(), TARGET_URL, targetPublishDate);
             System.out.println("符合篩選日期的公告筆數: " + matchedRows.size());
 
             for (int i = 0; i < matchedRows.size(); i++) {
-                RowMeta meta = matchedRows.get(i);
+                AnnouncementRow meta = matchedRows.get(i);
                 if (i > 0) {
                     // 適度間隔請求，避免短時間連發觸發 Cloudflare 頻率限制
                     Thread.sleep(1000);
@@ -96,19 +100,14 @@ public class ScraperService {
                 List<String> failedPdfUrls = new ArrayList<>();
 
                 String detailHtml = fetchDetailHtml(driver, meta.link());
-                Document detailDoc = Jsoup.parse(detailHtml, meta.link());
-                Elements attachmentLinks = detailDoc.select("a[href$=.pdf], a[href$=.odt], a[href*=dl-]");
-                Set<String> seenUrls = new LinkedHashSet<>();
+                List<AttachmentLink> attachmentLinks =
+                        detailPageParser.extractAttachmentLinks(detailHtml, meta.link());
 
                 String cookieHeader = buildCookieHeader(driver.manage().getCookies());
                 String userAgent = extractUserAgent(driver);
 
-                for (Element attachmentLink : attachmentLinks) {
-                    String attachmentUrl = attachmentLink.absUrl("href");
-                    if (attachmentUrl.isEmpty() || !seenUrls.add(attachmentUrl)) {
-                        continue;
-                    }
-
+                for (AttachmentLink attachmentLink : attachmentLinks) {
+                    String attachmentUrl = attachmentLink.url();
                     pdfUrls.add(attachmentUrl);
                     boolean downloaded = downloadViaBrowserFetch(
                             driver, attachmentUrl, attachmentLink.text(), pdfAttachments);
@@ -163,7 +162,7 @@ public class ScraperService {
             if (rawResult instanceof Map<?, ?> resultMap) {
                 boolean ok = Boolean.TRUE.equals(resultMap.get("ok"));
                 String html = resultMap.get("html") != null ? resultMap.get("html").toString() : "";
-                if (ok && !html.isBlank() && !isBlockedHtml(html)) {
+                if (ok && !html.isBlank() && !detailPageParser.isBlockedPage(html)) {
                     return html;
                 }
                 System.out.println("詳細頁 fetch 未直接取得內容 (status=" + resultMap.get("status") + ")，改用瀏覽器導航: " + detailUrl);
@@ -178,58 +177,6 @@ public class ScraperService {
                 By.xpath("//*[contains(text(),'發文字號') or contains(text(),'檔案下載')]"),
                 30);
         return driver.getPageSource();
-    }
-
-    private boolean isBlockedHtml(String html) {
-        return html.contains("請稍候")
-                || html.contains("Just a moment")
-                || html.contains("Attention Required")
-                || html.contains("challenges.cloudflare.com");
-    }
-
-    private List<RowMeta> extractMatchingRows(Document doc, String targetPublishDate) {
-        List<RowMeta> matched = new ArrayList<>();
-        Elements rows = doc.select("tr");
-        String resolvedDate = targetPublishDate;
-
-        for (Element row : rows) {
-            if (row.select("td").isEmpty()) {
-                continue;
-            }
-
-            String title = row.select("td.title a").text();
-            String href = row.select("td.title a").attr("href");
-            if (href.isBlank()) {
-                continue;
-            }
-            String link = href.startsWith("http") ? href : "https://www.nhi.gov.tw" + href;
-            String referenceNo = row.select("td[data-th=發文字號]").text();
-            String issueDate = row.select("td[data-th=發文日期] time").text().trim();
-            String publishDate = row.select("td[data-th=刊登日期] time").text().trim();
-            String listingDeadline = row.select("td[data-th=刊登期限] time").text().trim();
-
-            if (resolvedDate == null || resolvedDate.isBlank()) {
-                resolvedDate = publishDate;
-                System.out.println("自動鎖定最新刊登日期: " + resolvedDate);
-            }
-
-            if (resolvedDate.equals(publishDate)) {
-                matched.add(new RowMeta(title, link, referenceNo, issueDate, publishDate, listingDeadline));
-            } else if (!matched.isEmpty() && targetPublishDate == null) {
-                break;
-            }
-        }
-
-        return matched;
-    }
-
-    private record RowMeta(
-            String title,
-            String link,
-            String referenceNo,
-            String issueDate,
-            String publishDate,
-            String listingDeadline) {
     }
 
     private ChromeDriver connectToExistingChrome() {
